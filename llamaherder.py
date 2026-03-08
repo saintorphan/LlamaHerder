@@ -16,11 +16,12 @@ import urllib.request
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QColor, QFont, QIcon, QPalette, QPixmap, QPainter, QTextDocument
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QPushButton, QSpinBox, QSplitter,
-    QSystemTrayIcon, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
-    QVBoxLayout, QWidget,
+    QAction, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+    QPushButton, QScrollArea, QSpinBox, QSplitter, QSystemTrayIcon,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -28,6 +29,45 @@ from PyQt5.QtWidgets import (
 CONFIG_DIR = os.path.expanduser("~/.config/llamaherder")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 _OLD_WORKERS_FILE = os.path.join(CONFIG_DIR, "workers.json")
+
+_DEFAULT_SAMPLER_PROFILE = {
+    # Sampling
+    "temperature": 0.8,
+    "top_k": 40,
+    "top_p": 0.95,
+    "min_p": 0.05,
+    "typical_p": 1.0,
+    "dynatemp_range": 0.0,
+    "dynatemp_exponent": 1.0,
+    "top_n_sigma": -1.0,
+    "samplers": "top_k,tfs_z,typical_p,top_p,min_p,temperature",
+    # Penalties
+    "repeat_penalty": 1.1,
+    "repeat_last_n": 64,
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "penalize_nl": True,
+    "dry_multiplier": 0.0,
+    "dry_base": 1.75,
+    "dry_allowed_length": 2,
+    "dry_penalty_last_n": -1,
+    "xtc_probability": 0.0,
+    "xtc_threshold": 0.1,
+    # Generation
+    "n_predict": -1,
+    "seed": -1,
+    "mirostat": 0,
+    "mirostat_tau": 5.0,
+    "mirostat_eta": 0.1,
+    "tfs_z": 1.0,
+    "use_bos": True,
+    "ignore_eos": False,
+    "cache_prompt": True,
+    "stop": "",
+    # Grammar
+    "grammar": "",
+    "json_schema": "",
+}
 
 _DEFAULT_CONFIG = {
     "workers": [
@@ -41,6 +81,9 @@ _DEFAULT_CONFIG = {
     "local_name": "ag1 (local)",
     "parallel_slots": 1,
     "theme": "dark",
+    "sampler_profiles": {"Default": dict(_DEFAULT_SAMPLER_PROFILE)},
+    "active_sampler_profile": "Default",
+    "model_profile_map": {},
 }
 
 PING_INTERVAL_MS = 2000
@@ -71,6 +114,91 @@ MODEL_SIZES = [
     ("405B Q2", 150.0),
     ("405B Q4", 240.0),
 ]
+
+
+# ── Sampler tab layout & CLI flag mapping ─────────────────────────────────────
+
+# Human-readable labels for sampler fields, grouped by tab
+_SAMPLER_TABS = {
+    "Sampling": [
+        ("temperature", "Temperature"),
+        ("top_k", "Top-K"),
+        ("top_p", "Top-P"),
+        ("min_p", "Min-P"),
+        ("typical_p", "Typical-P"),
+        ("dynatemp_range", "Dynamic Temp Range"),
+        ("dynatemp_exponent", "Dynamic Temp Exponent"),
+        ("top_n_sigma", "Top-N Sigma"),
+        ("samplers", "Sampler Order"),
+    ],
+    "Penalties": [
+        ("repeat_penalty", "Repeat Penalty"),
+        ("repeat_last_n", "Repeat Last N"),
+        ("frequency_penalty", "Frequency Penalty"),
+        ("presence_penalty", "Presence Penalty"),
+        ("penalize_nl", "Penalize Newlines"),
+        ("dry_multiplier", "DRY Multiplier"),
+        ("dry_base", "DRY Base"),
+        ("dry_allowed_length", "DRY Allowed Length"),
+        ("dry_penalty_last_n", "DRY Penalty Last N"),
+        ("xtc_probability", "XTC Probability"),
+        ("xtc_threshold", "XTC Threshold"),
+    ],
+    "Generation": [
+        ("n_predict", "Max Tokens (n_predict)"),
+        ("seed", "Seed (-1 = random)"),
+        ("mirostat", "Mirostat (0/1/2)"),
+        ("mirostat_tau", "Mirostat Tau"),
+        ("mirostat_eta", "Mirostat Eta"),
+        ("tfs_z", "Tail-Free Sampling (z)"),
+        ("use_bos", "Add BOS Token"),
+        ("ignore_eos", "Ignore EOS Token"),
+        ("cache_prompt", "Cache Prompt"),
+        ("stop", "Stop Strings (one per line)"),
+    ],
+    "Grammar": [
+        ("grammar", "GBNF Grammar"),
+        ("json_schema", "JSON Schema"),
+    ],
+}
+
+# Map config keys → llama-server CLI flags
+_SAMPLER_FLAGS = {
+    "temperature": "--temp",
+    "top_k": "--top-k",
+    "top_p": "--top-p",
+    "min_p": "--min-p",
+    "typical_p": "--typical",
+    "repeat_penalty": "--repeat-penalty",
+    "repeat_last_n": "--repeat-last-n",
+    "frequency_penalty": "--frequency-penalty",
+    "presence_penalty": "--presence-penalty",
+    "mirostat": "--mirostat",
+    "mirostat_tau": "--mirostat-tau",
+    "mirostat_eta": "--mirostat-eta",
+    "tfs_z": "--tfs",
+    "seed": "--seed",
+    "n_predict": "--n-predict",
+    "dynatemp_range": "--dynatemp-range",
+    "dynatemp_exponent": "--dynatemp-exponent",
+    "top_n_sigma": "--top-n-sigma",
+    "penalize_nl": "--penalize-nl",
+    "dry_multiplier": "--dry-multiplier",
+    "dry_base": "--dry-base",
+    "dry_allowed_length": "--dry-allowed-length",
+    "dry_penalty_last_n": "--dry-penalty-last-n",
+    "xtc_probability": "--xtc-probability",
+    "xtc_threshold": "--xtc-threshold",
+    "samplers": "--samplers",
+    "ignore_eos": "--ignore-eos",
+    "cache_prompt": "--cache-prompt",
+}
+
+# Fields that are multiline text areas
+_MULTILINE_FIELDS = {"stop", "grammar", "json_schema"}
+
+# Fields that are boolean checkboxes
+_BOOL_FIELDS = {"penalize_nl", "use_bos", "ignore_eos", "cache_prompt"}
 
 
 _CMD_POLYGLOT_HEADER = """\
@@ -554,6 +682,334 @@ class OptionsDialog(QDialog):
         self.accept()
 
 
+# ── Sampler Dialog ────────────────────────────────────────────────────────────
+
+class SamplerDialog(QDialog):
+    """Tabbed dialog for sampler settings with profile CRUD and model associations."""
+
+    def __init__(self, config, model_list=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sampler Settings")
+        self.setMinimumSize(540, 600)
+        self.config = dict(config)
+        self._model_list = model_list or []
+
+        # Ensure sampler config keys exist
+        if "sampler_profiles" not in self.config:
+            self.config["sampler_profiles"] = {"Default": dict(_DEFAULT_SAMPLER_PROFILE)}
+        profiles = self.config["sampler_profiles"]
+        if "Default" not in profiles:
+            profiles["Default"] = dict(_DEFAULT_SAMPLER_PROFILE)
+        if "active_sampler_profile" not in self.config:
+            self.config["active_sampler_profile"] = "Default"
+        if "model_profile_map" not in self.config:
+            self.config["model_profile_map"] = {}
+
+        layout = QVBoxLayout(self)
+
+        # ── Profile selector row ──
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Profile:"))
+        self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(160)
+        self._refresh_profile_combo()
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
+        profile_row.addWidget(self.profile_combo, 1)
+
+        new_btn = QPushButton("New")
+        new_btn.setFixedWidth(55)
+        new_btn.clicked.connect(self._on_new_profile)
+        profile_row.addWidget(new_btn)
+
+        self.save_btn = QPushButton("Save")
+        self.save_btn.setFixedWidth(55)
+        self.save_btn.clicked.connect(self._on_save_profile)
+        profile_row.addWidget(self.save_btn)
+
+        self.rename_btn = QPushButton("Rename")
+        self.rename_btn.setFixedWidth(65)
+        self.rename_btn.clicked.connect(self._on_rename_profile)
+        profile_row.addWidget(self.rename_btn)
+
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.setFixedWidth(60)
+        self.delete_btn.clicked.connect(self._on_delete_profile)
+        profile_row.addWidget(self.delete_btn)
+
+        layout.addLayout(profile_row)
+
+        # ── Tabbed settings area ──
+        self.tabs = QTabWidget()
+        self._fields = {}  # key → QLineEdit / QCheckBox / QTextEdit
+
+        for tab_name, fields in _SAMPLER_TABS.items():
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            container = QWidget()
+            form = QFormLayout(container)
+            form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+            for key, label in fields:
+                default_val = _DEFAULT_SAMPLER_PROFILE.get(key, "")
+                if key in _BOOL_FIELDS:
+                    widget = QCheckBox()
+                    widget.setChecked(bool(default_val))
+                elif key in _MULTILINE_FIELDS:
+                    widget = QTextEdit()
+                    widget.setMaximumHeight(100)
+                    widget.setPlainText(str(default_val) if default_val else "")
+                else:
+                    widget = QLineEdit(str(default_val))
+
+                self._fields[key] = widget
+                form.addRow(label + ":", widget)
+
+            scroll.setWidget(container)
+            self.tabs.addTab(scroll, tab_name)
+
+        # ── Model Associations tab ──
+        assoc_widget = QWidget()
+        assoc_layout = QVBoxLayout(assoc_widget)
+        assoc_layout.addWidget(QLabel(
+            "Assign sampler profiles to models. When a model is launched,\n"
+            "its assigned profile will be used automatically."
+        ))
+
+        self.assoc_table = QTableWidget(0, 3)
+        self.assoc_table.setHorizontalHeaderLabels(["Model", "Profile", ""])
+        hdr = self.assoc_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.assoc_table.verticalHeader().setVisible(False)
+        self.assoc_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        assoc_layout.addWidget(self.assoc_table)
+
+        assoc_btn_row = QHBoxLayout()
+        add_assoc_btn = QPushButton("Add Association")
+        add_assoc_btn.clicked.connect(self._on_add_association)
+        assoc_btn_row.addWidget(add_assoc_btn)
+        assoc_btn_row.addStretch()
+        assoc_layout.addLayout(assoc_btn_row)
+
+        self.tabs.addTab(assoc_widget, "Model Associations")
+
+        layout.addWidget(self.tabs)
+
+        # ── Dialog buttons ──
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._apply_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # Load the active profile into fields
+        self._populate_fields(self.config["active_sampler_profile"])
+        self._populate_assoc_table()
+        self._update_default_protection()
+
+    # ── Profile combo helpers ──
+
+    def _refresh_profile_combo(self):
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        profiles = self.config["sampler_profiles"]
+        # Always put Default first
+        self.profile_combo.addItem("Default")
+        for name in sorted(profiles.keys()):
+            if name != "Default":
+                self.profile_combo.addItem(name)
+        active = self.config.get("active_sampler_profile", "Default")
+        idx = self.profile_combo.findText(active)
+        if idx >= 0:
+            self.profile_combo.setCurrentIndex(idx)
+        self.profile_combo.blockSignals(False)
+
+    def _update_default_protection(self):
+        is_default = self.profile_combo.currentText() == "Default"
+        self.save_btn.setEnabled(not is_default)
+        self.delete_btn.setEnabled(not is_default)
+        self.rename_btn.setEnabled(not is_default)
+        # Make fields read-only for Default
+        for key, widget in self._fields.items():
+            if isinstance(widget, QCheckBox):
+                widget.setEnabled(not is_default)
+            elif isinstance(widget, QTextEdit):
+                widget.setReadOnly(is_default)
+            else:
+                widget.setReadOnly(is_default)
+
+    def _populate_fields(self, profile_name):
+        profiles = self.config["sampler_profiles"]
+        profile = profiles.get(profile_name, _DEFAULT_SAMPLER_PROFILE)
+        for key, widget in self._fields.items():
+            val = profile.get(key, _DEFAULT_SAMPLER_PROFILE.get(key, ""))
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(val))
+            elif isinstance(widget, QTextEdit):
+                widget.setPlainText(str(val) if val else "")
+            else:
+                widget.setText(str(val))
+
+    def _read_fields(self):
+        """Read all field values, returning a dict with properly typed values."""
+        result = {}
+        for key, widget in self._fields.items():
+            if isinstance(widget, QCheckBox):
+                result[key] = widget.isChecked()
+            elif isinstance(widget, QTextEdit):
+                result[key] = widget.toPlainText().strip()
+            else:
+                text = widget.text().strip()
+                # Try to parse as number
+                if key not in _MULTILINE_FIELDS:
+                    try:
+                        result[key] = int(text)
+                        continue
+                    except ValueError:
+                        pass
+                    try:
+                        result[key] = float(text)
+                        continue
+                    except ValueError:
+                        pass
+                result[key] = text
+        return result
+
+    # ── Profile CRUD ──
+
+    def _on_profile_changed(self, name):
+        if not name:
+            return
+        self._populate_fields(name)
+        self._update_default_protection()
+
+    def _on_new_profile(self):
+        name, ok = QInputDialog.getText(self, "New Profile", "Profile name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name.lower() == "default":
+            QMessageBox.warning(self, "Reserved Name",
+                                "Cannot create a profile named 'Default'.")
+            return
+        if name in self.config["sampler_profiles"]:
+            QMessageBox.warning(self, "Duplicate",
+                                f"Profile '{name}' already exists.")
+            return
+        # Clone current field values into new profile
+        self.config["sampler_profiles"][name] = self._read_fields()
+        self._refresh_profile_combo()
+        self.profile_combo.setCurrentText(name)
+
+    def _on_save_profile(self):
+        name = self.profile_combo.currentText()
+        if name == "Default":
+            QMessageBox.warning(self, "Protected",
+                                "The Default profile cannot be overwritten.")
+            return
+        self.config["sampler_profiles"][name] = self._read_fields()
+        QMessageBox.information(self, "Saved", f"Profile '{name}' saved.")
+
+    def _on_rename_profile(self):
+        old_name = self.profile_combo.currentText()
+        if old_name == "Default":
+            return
+        new_name, ok = QInputDialog.getText(self, "Rename Profile",
+                                            "New name:", text=old_name)
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        if new_name.lower() == "default":
+            QMessageBox.warning(self, "Reserved Name",
+                                "Cannot rename to 'Default'.")
+            return
+        if new_name in self.config["sampler_profiles"]:
+            QMessageBox.warning(self, "Duplicate",
+                                f"Profile '{new_name}' already exists.")
+            return
+        profiles = self.config["sampler_profiles"]
+        profiles[new_name] = profiles.pop(old_name)
+        # Update model associations
+        model_map = self.config.get("model_profile_map", {})
+        for model, prof in list(model_map.items()):
+            if prof == old_name:
+                model_map[model] = new_name
+        if self.config.get("active_sampler_profile") == old_name:
+            self.config["active_sampler_profile"] = new_name
+        self._refresh_profile_combo()
+        self.profile_combo.setCurrentText(new_name)
+        self._populate_assoc_table()
+
+    def _on_delete_profile(self):
+        name = self.profile_combo.currentText()
+        if name == "Default":
+            QMessageBox.warning(self, "Protected",
+                                "The Default profile cannot be deleted.")
+            return
+        reply = QMessageBox.question(
+            self, "Delete Profile",
+            f"Delete profile '{name}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        del self.config["sampler_profiles"][name]
+        # Clean up model associations pointing to this profile
+        model_map = self.config.get("model_profile_map", {})
+        for model in [m for m, p in model_map.items() if p == name]:
+            del model_map[model]
+        if self.config.get("active_sampler_profile") == name:
+            self.config["active_sampler_profile"] = "Default"
+        self._refresh_profile_combo()
+        self.profile_combo.setCurrentText("Default")
+        self._populate_assoc_table()
+
+    # ── Model Associations ──
+
+    def _populate_assoc_table(self):
+        model_map = self.config.get("model_profile_map", {})
+        self.assoc_table.setRowCount(len(model_map))
+        for row, (model, profile) in enumerate(sorted(model_map.items())):
+            self.assoc_table.setItem(row, 0, QTableWidgetItem(model))
+            self.assoc_table.setItem(row, 1, QTableWidgetItem(profile))
+            remove_btn = QPushButton("Remove")
+            remove_btn.clicked.connect(lambda checked, m=model: self._remove_association(m))
+            self.assoc_table.setCellWidget(row, 2, remove_btn)
+
+    def _on_add_association(self):
+        if not self._model_list:
+            QMessageBox.information(self, "No Models",
+                                    "No models found. Add models to your model directory first.")
+            return
+        model, ok = QInputDialog.getItem(
+            self, "Select Model", "Model:", self._model_list, 0, False)
+        if not ok or not model:
+            return
+        profile_names = list(self.config["sampler_profiles"].keys())
+        profile, ok = QInputDialog.getItem(
+            self, "Select Profile", "Sampler profile:", profile_names, 0, False)
+        if not ok or not profile:
+            return
+        self.config.setdefault("model_profile_map", {})[model] = profile
+        self._populate_assoc_table()
+
+    def _remove_association(self, model):
+        model_map = self.config.get("model_profile_map", {})
+        if model in model_map:
+            del model_map[model]
+        self._populate_assoc_table()
+
+    # ── Apply ──
+
+    def _apply_and_accept(self):
+        name = self.profile_combo.currentText()
+        # Auto-save current edits if not Default
+        if name != "Default":
+            self.config["sampler_profiles"][name] = self._read_fields()
+        self.config["active_sampler_profile"] = name
+        self.accept()
+
+
 # ── Generate Worker Dialog ────────────────────────────────────────────────────
 
 class GenerateWorkerDialog(QDialog):
@@ -1032,6 +1488,40 @@ def _apply_theme(app, theme_name):
         app.setPalette(app.style().standardPalette())
 
 
+# ── Help Window (non-blocking) ────────────────────────────────────────────────
+
+class HelpWindow(QDialog):
+    """Non-modal scrollable README viewer."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("LlamaHerder Help")
+        self.setMinimumSize(620, 500)
+        self.resize(680, 600)
+        self.setModal(False)
+
+        layout = QVBoxLayout(self)
+
+        self.text_view = QTextEdit()
+        self.text_view.setReadOnly(True)
+        self.text_view.setFont(QFont("Monospace", 10))
+
+        # Load README.md from the same directory as the script
+        readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
+        try:
+            with open(readme_path, "r") as f:
+                content = f.read()
+            self.text_view.setMarkdown(content)
+        except OSError:
+            self.text_view.setPlainText("README.md not found.")
+
+        layout.addWidget(self.text_view)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+
+
 # ── Main Window ──────────────────────────────────────────────────────────────
 
 class LauncherWindow(QMainWindow):
@@ -1090,6 +1580,10 @@ class LauncherWindow(QMainWindow):
         options_action.triggered.connect(self._open_options)
         file_menu.addAction(options_action)
 
+        sampler_action = QAction("Sampler", self)
+        sampler_action.triggered.connect(self._open_sampler)
+        file_menu.addAction(sampler_action)
+
         file_menu.addSeparator()
 
         exit_action = QAction("Exit", self)
@@ -1106,6 +1600,12 @@ class LauncherWindow(QMainWindow):
         deploy_ssh_action = QAction("Deploy via SSH...", self)
         deploy_ssh_action.triggered.connect(self._open_deploy_ssh)
         workers_menu.addAction(deploy_ssh_action)
+
+        # ── Help menu ──
+        help_menu = menu_bar.addMenu("Help")
+        help_action = QAction("Help", self)
+        help_action.triggered.connect(self._open_help)
+        help_menu.addAction(help_action)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1471,6 +1971,24 @@ class LauncherWindow(QMainWindow):
                     self, "Server Running",
                     "Some changes will take effect after restarting the server.",
                 )
+
+    def _open_sampler(self):
+        # Gather current model list for associations
+        model_list = []
+        for i in range(self.model_combo.count()):
+            txt = self.model_combo.itemText(i)
+            if txt and txt != "No models found":
+                model_list.append(txt)
+
+        dlg = SamplerDialog(self._config, model_list=model_list, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self._config = dlg.config
+            _save_config(self._config)
+
+    def _open_help(self):
+        # Keep a reference so it isn't garbage-collected
+        self._help_window = HelpWindow(self)
+        self._help_window.show()
 
     # ── Workers menu actions ─────────────────────────────────────────────
 
@@ -1842,6 +2360,47 @@ class LauncherWindow(QMainWindow):
             cmd += ["-np", str(parallel_slots)]
         if rpc_addrs:
             cmd += ["--rpc", ",".join(rpc_addrs)]
+
+        # ── Sampler parameters ──
+        # Check for model-specific profile, fall back to active profile
+        model_map = self._config.get("model_profile_map", {})
+        active_profile = model_map.get(
+            model_name,
+            self._config.get("active_sampler_profile", "Default"),
+        )
+        profiles = self._config.get("sampler_profiles", {})
+        sampler = profiles.get(active_profile, _DEFAULT_SAMPLER_PROFILE)
+
+        for key, flag in _SAMPLER_FLAGS.items():
+            val = sampler.get(key)
+            if val is None:
+                continue
+            if isinstance(val, bool):
+                if val:
+                    cmd.append(flag)
+            elif isinstance(val, str):
+                if val:  # skip empty strings
+                    cmd += [flag, val]
+            else:
+                cmd += [flag, str(val)]
+
+        # Stop strings (one per line → multiple --stop flags)
+        stop_text = sampler.get("stop", "")
+        if stop_text:
+            for line in stop_text.splitlines():
+                line = line.strip()
+                if line:
+                    cmd += ["--stop", line]
+
+        # Grammar (passed inline)
+        grammar = sampler.get("grammar", "")
+        if grammar.strip():
+            cmd += ["--grammar", grammar.strip()]
+
+        # JSON schema
+        json_schema = sampler.get("json_schema", "")
+        if json_schema.strip():
+            cmd += ["--json-schema", json_schema.strip()]
 
         try:
             self.server_proc = subprocess.Popen(
