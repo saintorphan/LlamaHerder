@@ -3,11 +3,13 @@
 
 import json
 import os
+import platform
 import shutil
 import socket
 import subprocess
 import signal
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -69,6 +71,20 @@ MODEL_SIZES = [
     ("405B Q2", 150.0),
     ("405B Q4", 240.0),
 ]
+
+
+_CMD_POLYGLOT_HEADER = """\
+0<0# : ^
+\"\"\"
+@echo off
+where python >nul 2>&1 && (python "%~f0" %* & exit /b)
+where python3 >nul 2>&1 && (python3 "%~f0" %* & exit /b)
+where py >nul 2>&1 && (py -3 "%~f0" %* & exit /b)
+echo Python not found. Install from https://python.org
+pause
+exit /b 1
+\"\"\"
+"""
 
 
 def _load_config():
@@ -237,7 +253,7 @@ class WorkerAgentPoller(QThread):
                         "vram_free_mb": free,
                         "vram_total_mb": total,
                         "battery_pct": None,
-                        "power_source": None,
+                        "power_source": "AC",
                     }
                 else:
                     data = self._query(host, self._agent_port)
@@ -538,6 +554,457 @@ class OptionsDialog(QDialog):
         self.accept()
 
 
+# ── Generate Worker Dialog ────────────────────────────────────────────────────
+
+class GenerateWorkerDialog(QDialog):
+    """Dialog to generate a pre-configured worker script for any OS."""
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Generate Worker Script")
+        self.setMinimumWidth(400)
+        self._config = config
+
+        layout = QFormLayout(self)
+
+        # Worker selector
+        self.worker_combo = QComboBox()
+        for w in config.get("workers", []):
+            self.worker_combo.addItem(w.get("name", w["ip"]), w)
+        self.worker_combo.currentIndexChanged.connect(self._on_worker_changed)
+        layout.addRow("Worker:", self.worker_combo)
+
+        # RPC Port
+        self.rpc_port_spin = QSpinBox()
+        self.rpc_port_spin.setRange(1, 65535)
+        layout.addRow("RPC Port:", self.rpc_port_spin)
+
+        # Agent Port
+        self.agent_port_spin = QSpinBox()
+        self.agent_port_spin.setRange(1, 65535)
+        self.agent_port_spin.setValue(config.get("agent_port", 50053))
+        layout.addRow("Agent Port:", self.agent_port_spin)
+
+        # Target OS
+        self.os_combo = QComboBox()
+        self.os_combo.addItems(["Auto-detect", "Windows", "Linux", "macOS"])
+        layout.addRow("Target OS:", self.os_combo)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save As...")
+        save_btn.clicked.connect(self._on_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addRow(btn_row)
+
+        # Initialize ports from first worker
+        self._on_worker_changed(0)
+
+    def _on_worker_changed(self, index):
+        data = self.worker_combo.currentData()
+        if data:
+            self.rpc_port_spin.setValue(data.get("port", 50052))
+
+    def _on_save(self):
+        target_os = self.os_combo.currentText()
+        if target_os == "Auto-detect":
+            target_os = platform.system()
+            if target_os == "Darwin":
+                target_os = "macOS"
+
+        # Read template
+        template_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "workers", "llama-worker.py"
+        )
+        try:
+            with open(template_path, "r") as f:
+                content = f.read()
+        except OSError as e:
+            QMessageBox.critical(self, "Error", f"Could not read template:\n{e}")
+            return
+
+        # Substitute ports
+        content = content.replace(
+            "DEFAULT_RPC_PORT = 50052",
+            f"DEFAULT_RPC_PORT = {self.rpc_port_spin.value()}",
+        )
+        content = content.replace(
+            "DEFAULT_AGENT_PORT = 50053",
+            f"DEFAULT_AGENT_PORT = {self.agent_port_spin.value()}",
+        )
+
+        if target_os == "Windows":
+            # Strip shebang, prepend polyglot header, save as .cmd
+            if content.startswith("#!/"):
+                content = content[content.index("\n") + 1:]
+            content = _CMD_POLYGLOT_HEADER + content
+            default_name = "llama-worker.cmd"
+            filter_str = "CMD Script (*.cmd);;All Files (*)"
+        else:
+            default_name = "llama-worker.py"
+            filter_str = "Python Script (*.py);;All Files (*)"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Worker Script", default_name, filter_str,
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="\n") as f:
+                f.write(content)
+            if target_os != "Windows":
+                os.chmod(path, 0o755)
+            QMessageBox.information(
+                self, "Success",
+                f"Worker script saved to:\n{path}\n\n"
+                f"RPC port: {self.rpc_port_spin.value()}\n"
+                f"Agent port: {self.agent_port_spin.value()}\n"
+                f"Target OS: {target_os}",
+            )
+            self.accept()
+        except OSError as e:
+            QMessageBox.critical(self, "Error", f"Could not save file:\n{e}")
+
+
+# ── SSH Deploy Thread ─────────────────────────────────────────────────────────
+
+class SSHDeployThread(QThread):
+    """Background thread that deploys worker script to a remote machine via SSH."""
+
+    log_line = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+
+    _SSH_OPTS = [
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=accept-new",
+    ]
+
+    def __init__(self, host, username, key_file, rpc_port, agent_port,
+                 remote_path, template_path, parent=None):
+        super().__init__(parent)
+        self._host = host
+        self._username = username
+        self._key_file = key_file
+        self._rpc_port = rpc_port
+        self._agent_port = agent_port
+        self._remote_path = remote_path
+        self._template_path = template_path
+
+    def _ssh_base(self):
+        cmd = ["ssh"] + self._SSH_OPTS
+        if self._key_file:
+            cmd += ["-i", self._key_file]
+        cmd.append(f"{self._username}@{self._host}")
+        return cmd
+
+    def _run_cmd(self, cmd, description):
+        self.log_line.emit(f"  $ {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+            )
+            if result.stdout.strip():
+                self.log_line.emit(f"  {result.stdout.strip()}")
+            if result.stderr.strip():
+                self.log_line.emit(f"  {result.stderr.strip()}")
+            return result
+        except subprocess.TimeoutExpired:
+            self.log_line.emit(f"  TIMEOUT: {description}")
+            return None
+        except FileNotFoundError:
+            self.log_line.emit(f"  ERROR: command not found")
+            return None
+
+    def run(self):
+        try:
+            # Step 1: Detect remote OS
+            self.log_line.emit("[1/6] Detecting remote OS...")
+            result = self._run_cmd(self._ssh_base() + ["uname", "-s"], "uname")
+            if not result or result.returncode != 0:
+                self.finished_signal.emit(False, "Failed to connect or detect OS")
+                return
+
+            uname = result.stdout.strip()
+            if uname.startswith(("MINGW", "MSYS", "CYGWIN")):
+                remote_os = "Windows"
+            elif uname == "Darwin":
+                remote_os = "macOS"
+            else:
+                remote_os = "Linux"
+            self.log_line.emit(f"  Remote OS: {remote_os} ({uname})")
+
+            # Step 2: Read template and substitute ports
+            self.log_line.emit("[2/6] Preparing worker script...")
+            try:
+                with open(self._template_path, "r") as f:
+                    content = f.read()
+            except OSError as e:
+                self.finished_signal.emit(False, f"Cannot read template: {e}")
+                return
+
+            content = content.replace(
+                "DEFAULT_RPC_PORT = 50052",
+                f"DEFAULT_RPC_PORT = {self._rpc_port}",
+            )
+            content = content.replace(
+                "DEFAULT_AGENT_PORT = 50053",
+                f"DEFAULT_AGENT_PORT = {self._agent_port}",
+            )
+
+            if remote_os == "Windows":
+                if content.startswith("#!/"):
+                    content = content[content.index("\n") + 1:]
+                content = _CMD_POLYGLOT_HEADER + content
+
+            self.log_line.emit(f"  Ports: RPC={self._rpc_port}, Agent={self._agent_port}")
+
+            # Step 3: Write to temp file
+            suffix = ".cmd" if remote_os == "Windows" else ".py"
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=suffix, delete=False, newline="\n",
+            )
+            tmp.write(content)
+            tmp.close()
+
+            # Step 4: Kill existing worker on remote
+            self.log_line.emit("[3/6] Stopping existing worker (if any)...")
+            self._run_cmd(
+                self._ssh_base() + ["pkill", "-f", "llama-worker", "||", "true"],
+                "pkill",
+            )
+
+            # Step 5: SCP file to remote
+            self.log_line.emit(f"[4/6] Uploading to {self._remote_path}...")
+            scp_cmd = ["scp"] + self._SSH_OPTS
+            if self._key_file:
+                scp_cmd += ["-i", self._key_file]
+            scp_cmd += [tmp.name, f"{self._username}@{self._host}:{self._remote_path}"]
+            result = self._run_cmd(scp_cmd, "scp")
+            os.unlink(tmp.name)
+            if not result or result.returncode != 0:
+                self.finished_signal.emit(False, "SCP upload failed")
+                return
+
+            # Step 6: chmod +x (non-Windows)
+            if remote_os != "Windows":
+                self.log_line.emit("[5/6] Setting executable permission...")
+                self._run_cmd(
+                    self._ssh_base() + ["chmod", "+x", self._remote_path],
+                    "chmod",
+                )
+            else:
+                self.log_line.emit("[5/6] Skipped chmod (Windows)")
+
+            # Step 7: Start worker
+            self.log_line.emit("[6/6] Starting worker...")
+            if remote_os == "Windows":
+                start_cmd = self._ssh_base() + [
+                    f"start /B python {self._remote_path}",
+                ]
+            else:
+                start_cmd = self._ssh_base() + [
+                    f"nohup python3 {self._remote_path} > /dev/null 2>&1 &",
+                ]
+            self._run_cmd(start_cmd, "start worker")
+
+            self.finished_signal.emit(True, f"Worker deployed to {self._host}")
+
+        except Exception as e:
+            self.finished_signal.emit(False, str(e))
+
+
+# ── Deploy SSH Dialog ─────────────────────────────────────────────────────────
+
+class DeploySSHDialog(QDialog):
+    """Dialog to deploy a worker script to a remote machine via SSH."""
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Deploy Worker via SSH")
+        self.setMinimumWidth(520)
+        self.setMinimumHeight(400)
+        self._config = config
+        self._deploy_thread = None
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        # Worker selector
+        self.worker_combo = QComboBox()
+        for w in config.get("workers", []):
+            self.worker_combo.addItem(
+                f"{w.get('name', w['ip'])}  ({w['ip']})", w,
+            )
+        self.worker_combo.currentIndexChanged.connect(self._on_worker_changed)
+        form.addRow("Worker:", self.worker_combo)
+
+        # RPC Port
+        self.rpc_port_spin = QSpinBox()
+        self.rpc_port_spin.setRange(1, 65535)
+        form.addRow("RPC Port:", self.rpc_port_spin)
+
+        # Agent Port
+        self.agent_port_spin = QSpinBox()
+        self.agent_port_spin.setRange(1, 65535)
+        self.agent_port_spin.setValue(config.get("agent_port", 50053))
+        form.addRow("Agent Port:", self.agent_port_spin)
+
+        # SSH Username
+        self.username_edit = QLineEdit(os.environ.get("USER", ""))
+        form.addRow("SSH Username:", self.username_edit)
+
+        # SSH Key File
+        key_row = QHBoxLayout()
+        default_key = os.path.expanduser("~/.ssh/id_rsa")
+        if not os.path.isfile(default_key):
+            ed25519 = os.path.expanduser("~/.ssh/id_ed25519")
+            if os.path.isfile(ed25519):
+                default_key = ed25519
+        self.key_edit = QLineEdit(default_key)
+        key_browse = QPushButton("Browse...")
+        key_browse.setFixedWidth(80)
+        key_browse.clicked.connect(self._browse_key)
+        key_row.addWidget(self.key_edit)
+        key_row.addWidget(key_browse)
+        form.addRow("SSH Key File:", key_row)
+
+        # Remote Path
+        self.remote_path_edit = QLineEdit("~/llama-worker.py")
+        form.addRow("Remote Path:", self.remote_path_edit)
+
+        layout.addLayout(form)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.test_btn = QPushButton("Test Connection")
+        self.test_btn.clicked.connect(self._on_test)
+        self.deploy_btn = QPushButton("Deploy")
+        self.deploy_btn.clicked.connect(self._on_deploy)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.test_btn)
+        btn_row.addWidget(self.deploy_btn)
+        btn_row.addWidget(self.cancel_btn)
+        layout.addLayout(btn_row)
+
+        # Log area
+        self.log_area = QTextEdit()
+        self.log_area.setReadOnly(True)
+        self.log_area.setFont(QFont("Monospace", 9))
+        self.log_area.setStyleSheet(
+            "QTextEdit { background-color: #1e1e1e; color: #dcdcdc; }"
+        )
+        layout.addWidget(self.log_area)
+
+        # Initialize from first worker
+        self._on_worker_changed(0)
+
+    def _on_worker_changed(self, index):
+        data = self.worker_combo.currentData()
+        if data:
+            self.rpc_port_spin.setValue(data.get("port", 50052))
+
+    def _browse_key(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Select SSH Key",
+            os.path.expanduser("~/.ssh/"),
+        )
+        if f:
+            self.key_edit.setText(f)
+
+    def _get_host(self):
+        data = self.worker_combo.currentData()
+        return data["ip"] if data else ""
+
+    def _on_test(self):
+        host = self._get_host()
+        username = self.username_edit.text().strip()
+        key_file = self.key_edit.text().strip()
+        if not host or not username:
+            self.log_area.append("ERROR: Worker and username are required.")
+            return
+
+        self.log_area.append(f"Testing connection to {username}@{host}...")
+        cmd = ["ssh",
+               "-o", "BatchMode=yes",
+               "-o", "ConnectTimeout=10",
+               "-o", "StrictHostKeyChecking=accept-new"]
+        if key_file:
+            cmd += ["-i", key_file]
+        cmd += [f"{username}@{host}", "echo", "ok"]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0 and "ok" in result.stdout:
+                self.log_area.append("  Connection successful!")
+            else:
+                self.log_area.append(f"  Connection failed (code {result.returncode})")
+                if result.stderr.strip():
+                    self.log_area.append(f"  {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            self.log_area.append("  Connection timed out.")
+        except FileNotFoundError:
+            self.log_area.append("  ERROR: ssh command not found.")
+
+    def _on_deploy(self):
+        host = self._get_host()
+        username = self.username_edit.text().strip()
+        key_file = self.key_edit.text().strip()
+        remote_path = self.remote_path_edit.text().strip()
+        if not host or not username or not remote_path:
+            self.log_area.append("ERROR: Worker, username, and remote path are required.")
+            return
+
+        template_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "workers", "llama-worker.py"
+        )
+        if not os.path.isfile(template_path):
+            self.log_area.append(f"ERROR: Template not found at {template_path}")
+            return
+
+        self.log_area.clear()
+        self.log_area.append(f"Deploying to {username}@{host}:{remote_path}")
+        self.log_area.append("")
+
+        # Disable buttons during deploy
+        self.test_btn.setEnabled(False)
+        self.deploy_btn.setEnabled(False)
+
+        self._deploy_thread = SSHDeployThread(
+            host=host,
+            username=username,
+            key_file=key_file,
+            rpc_port=self.rpc_port_spin.value(),
+            agent_port=self.agent_port_spin.value(),
+            remote_path=remote_path,
+            template_path=template_path,
+            parent=self,
+        )
+        self._deploy_thread.log_line.connect(self._on_log_line)
+        self._deploy_thread.finished_signal.connect(self._on_deploy_finished)
+        self._deploy_thread.start()
+
+    def _on_log_line(self, text):
+        self.log_area.append(text)
+        sb = self.log_area.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_deploy_finished(self, success, message):
+        self.test_btn.setEnabled(True)
+        self.deploy_btn.setEnabled(True)
+        self.log_area.append("")
+        if success:
+            self.log_area.append(f"SUCCESS: {message}")
+        else:
+            self.log_area.append(f"FAILED: {message}")
+
+
 # ── Theme ────────────────────────────────────────────────────────────────────
 
 def _apply_theme(app, theme_name):
@@ -629,6 +1096,17 @@ class LauncherWindow(QMainWindow):
         exit_action.triggered.connect(self._tray_exit)
         file_menu.addAction(exit_action)
 
+        # ── Workers menu ──
+        workers_menu = menu_bar.addMenu("Workers")
+
+        gen_worker_action = QAction("Generate Worker...", self)
+        gen_worker_action.triggered.connect(self._open_generate_worker)
+        workers_menu.addAction(gen_worker_action)
+
+        deploy_ssh_action = QAction("Deploy via SSH...", self)
+        deploy_ssh_action.triggered.connect(self._open_deploy_ssh)
+        workers_menu.addAction(deploy_ssh_action)
+
         central = QWidget()
         self.setCentralWidget(central)
         outer = QHBoxLayout(central)
@@ -640,7 +1118,8 @@ class LauncherWindow(QMainWindow):
         # ── Left panel (controls) ──
         left_widget = QWidget()
         self.main_layout = QVBoxLayout(left_widget)
-        self.main_layout.setSpacing(12)
+        self.main_layout.setSpacing(6)
+        self.main_layout.setContentsMargins(6, 6, 6, 6)
 
         # ── Right panel (server log) ──
         right_widget = QWidget()
@@ -694,51 +1173,47 @@ class LauncherWindow(QMainWindow):
         self._populate_worker_table()
         self.main_layout.addWidget(self.table)
 
-        # ── Cluster summary (hidden while server is running) ────────────
-        self.cluster_frame = QWidget()
-        cl = QVBoxLayout(self.cluster_frame)
-        cl.setContentsMargins(0, 0, 0, 0)
-        cl.addWidget(self._make_label("Cluster"))
-        self.cluster_vram_label = QLabel("Total VRAM: --")
-        self.cluster_vram_label.setFont(QFont("sans-serif", 10))
-        cl.addWidget(self.cluster_vram_label)
+        # Model + Context headers
+        header_row = QHBoxLayout()
+        header_row.addWidget(self._make_label("Model"), 1)
+        ctx_header = self._make_label("Context")
+        ctx_header.setFixedWidth(80)
+        header_row.addWidget(ctx_header)
+        spacer_label = QLabel("")
+        spacer_label.setFixedWidth(80)
+        header_row.addWidget(spacer_label)
+        self.main_layout.addLayout(header_row)
 
-        self.cluster_fits_label = QLabel("")
-        self.cluster_fits_label.setWordWrap(True)
-        self.cluster_fits_label.setFont(QFont("sans-serif", 9))
-        self.cluster_fits_label.setStyleSheet("color: #aaa;")
-        cl.addWidget(self.cluster_fits_label)
-
-        self.cluster_rec_label = QLabel("")
-        self.cluster_rec_label.setWordWrap(True)
-        self.cluster_rec_label.setFont(QFont("sans-serif", 10, QFont.Bold))
-        self.cluster_rec_label.setStyleSheet("color: #2ecc71;")
-        cl.addWidget(self.cluster_rec_label)
-        self.main_layout.addWidget(self.cluster_frame)
-
-        # Model selector
-        self.main_layout.addWidget(self._make_label("Model"))
-        model_row = QHBoxLayout()
+        # Model dropdown, Context dropdown, Refresh — one line, matched to Launch height
+        selector_row = QHBoxLayout()
         self.model_combo = QComboBox()
+        self.model_combo.setFixedHeight(36)
         self.model_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.model_combo.currentIndexChanged.connect(self._update_context_options)
-        model_row.addWidget(self.model_combo, 1)
+        selector_row.addWidget(self.model_combo, 1)
+        self.ctx_combo = QComboBox()
+        self.ctx_combo.setFixedHeight(36)
+        self.ctx_combo.setFixedWidth(80)
+        self.ctx_combo.currentIndexChanged.connect(self._update_overhead)
+        selector_row.addWidget(self.ctx_combo)
         refresh_btn = QPushButton("Refresh")
         refresh_btn.setFixedWidth(80)
+        refresh_btn.setFixedHeight(36)
         refresh_btn.clicked.connect(self._scan_models)
-        model_row.addWidget(refresh_btn)
-        self.main_layout.addLayout(model_row)
+        selector_row.addWidget(refresh_btn)
+        self.main_layout.addLayout(selector_row)
 
-        # Context size selector
-        ctx_row = QHBoxLayout()
-        ctx_label = QLabel("Context:")
-        ctx_label.setFont(QFont("sans-serif", 10))
-        ctx_row.addWidget(ctx_label)
-        self.ctx_combo = QComboBox()
-        self.ctx_combo.setMinimumWidth(220)
-        ctx_row.addWidget(self.ctx_combo)
-        ctx_row.addStretch()
-        self.main_layout.addLayout(ctx_row)
+        # Estimated Overhead line
+        self.overhead_label = QLabel("")
+        self.overhead_label.setFont(QFont("sans-serif", 11, QFont.Bold))
+        self.main_layout.addWidget(self.overhead_label)
+
+        # Recommendation (below overhead)
+        self.cluster_rec_label = QLabel("")
+        self.cluster_rec_label.setWordWrap(True)
+        self.cluster_rec_label.setFont(QFont("sans-serif", 11, QFont.Bold))
+        self.cluster_rec_label.setStyleSheet("color: #2ecc71;")
+        self.main_layout.addWidget(self.cluster_rec_label)
 
         # Status row (label + browser button)
         status_row = QHBoxLayout()
@@ -759,6 +1234,12 @@ class LauncherWindow(QMainWindow):
         self.launch_btn.setFixedHeight(36)
         self.launch_btn.clicked.connect(self._on_launch)
         btn_row.addWidget(self.launch_btn)
+
+        self.unload_btn = QPushButton("Unload")
+        self.unload_btn.setFixedHeight(36)
+        self.unload_btn.setToolTip("Kill all llama-server processes to free VRAM")
+        self.unload_btn.clicked.connect(self._on_unload)
+        btn_row.addWidget(self.unload_btn)
 
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setFixedHeight(36)
@@ -802,6 +1283,7 @@ class LauncherWindow(QMainWindow):
         mon.addWidget(self.worker_load_label)
 
         self.main_layout.addWidget(self.monitor_frame)
+        self.main_layout.addStretch(1)
 
         self._scan_models()
 
@@ -891,7 +1373,9 @@ class LauncherWindow(QMainWindow):
     # ── Worker table helpers ─────────────────────────────────────────────
 
     def _resize_worker_table(self, expanded=False):
-        h = 36 + len(self.workers) * 32
+        # +1 for the summary row
+        n_rows = len(self.workers) + 1
+        h = 36 + n_rows * 32
         self.table.setMinimumHeight(h)
         if expanded:
             self.table.setMaximumHeight(16777215)  # QWIDGETSIZE_MAX
@@ -899,7 +1383,8 @@ class LauncherWindow(QMainWindow):
             self.table.setMaximumHeight(h)
 
     def _populate_worker_table(self):
-        self.table.setRowCount(len(self.workers))
+        n_workers = len(self.workers)
+        self.table.setRowCount(n_workers + 1)  # +1 for summary row
         for row, (host, port, name) in enumerate(self.workers):
             self.table.setItem(row, 0, QTableWidgetItem(name))
             port_text = str(port) if host != "local" else "--"
@@ -910,7 +1395,40 @@ class LauncherWindow(QMainWindow):
             self.table.setItem(row, 4, self._centered("--"))
             self.table.setItem(row, 5, self._centered("--"))
             self.table.setItem(row, 6, self._centered("--"))
+        # Summary row
+        self._update_vram_summary_row()
         self._resize_worker_table()
+
+    def _update_vram_summary_row(self):
+        """Write the Total VRAM summary into the last row of the worker table."""
+        row = self.table.rowCount() - 1
+        if row < 0:
+            return
+        total_free = 0
+        total_cap = 0
+        for host, _port, _name in self.workers:
+            data = self._agent_data.get(host, {})
+            free = data.get("vram_free_mb")
+            total = data.get("vram_total_mb")
+            if free is not None and total is not None:
+                total_free += free
+                total_cap += total
+
+        label_item = QTableWidgetItem("Total VRAM")
+        label_item.setFont(QFont("sans-serif", 9, QFont.Bold))
+        label_item.setForeground(QColor("#aaa"))
+        self.table.setItem(row, 0, label_item)
+
+        if total_cap > 0:
+            vram_item = self._vram_item(total_free, total_cap)
+        else:
+            vram_item = self._centered("--")
+            vram_item.setForeground(QColor("#aaa"))
+        self.table.setItem(row, 4, vram_item)
+
+        # Clear other cells in summary row
+        for col in (1, 2, 3, 5, 6):
+            self.table.setItem(row, col, QTableWidgetItem(""))
 
     # ── Options dialog ───────────────────────────────────────────────────
 
@@ -953,6 +1471,28 @@ class LauncherWindow(QMainWindow):
                     self, "Server Running",
                     "Some changes will take effect after restarting the server.",
                 )
+
+    # ── Workers menu actions ─────────────────────────────────────────────
+
+    def _open_generate_worker(self):
+        if not self._config.get("workers"):
+            QMessageBox.warning(
+                self, "No Workers",
+                "Add at least one worker in File > Options first.",
+            )
+            return
+        dlg = GenerateWorkerDialog(self._config, self)
+        dlg.exec_()
+
+    def _open_deploy_ssh(self):
+        if not self._config.get("workers"):
+            QMessageBox.warning(
+                self, "No Workers",
+                "Add at least one worker in File > Options first.",
+            )
+            return
+        dlg = DeploySSHDialog(self._config, self)
+        dlg.exec_()
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1008,12 +1548,13 @@ class LauncherWindow(QMainWindow):
         if source is None:
             return self._centered("N/A")
         display = {
+            "AC": "AC",
             "Charging": "AC (charging)",
             "Full": "AC (full)",
             "Not charging": "AC (held)",
-            "Discharging": "Battery",
+            "Discharging": "\U0001F50B",
         }
-        return self._centered(display.get(source, source))
+        return self._centered(display.get(source, "N/A"))
 
     def _scan_models(self):
         current = self.model_combo.currentText()
@@ -1078,7 +1619,7 @@ class LauncherWindow(QMainWindow):
         n_slots = self._config.get("parallel_slots", 1)
 
         if model_gb is None or free_gb == 0:
-            self.ctx_combo.addItem("2048 (default)", 2048)
+            self.ctx_combo.addItem("2K", 2048)
             return
 
         headroom = free_gb - model_gb
@@ -1098,9 +1639,7 @@ class LauncherWindow(QMainWindow):
                 tag = "won't fit"
 
             ctx_k = f"{ctx // 1024}K" if ctx >= 1024 else str(ctx)
-            slots_note = f" x{n_slots} slots" if n_slots > 1 else ""
-            label = f"{ctx_k}  (~{kv:.1f} GB KV cache{slots_note}, {tag})"
-            self.ctx_combo.addItem(label, ctx)
+            self.ctx_combo.addItem(ctx_k, ctx)
 
             idx = self.ctx_combo.count() - 1
             if tag == "comfortable":
@@ -1119,9 +1658,48 @@ class LauncherWindow(QMainWindow):
                     return
         self.ctx_combo.setCurrentIndex(best_idx)
 
+    def _update_overhead(self):
+        """Update the Estimated Overhead label based on model + context selection."""
+        model_gb = self._model_file_size_gb()
+        free_gb = self._cluster_free_gb()
+        n_slots = self._config.get("parallel_slots", 1)
+        ctx = self.ctx_combo.currentData()
+
+        if model_gb is None or free_gb == 0 or ctx is None:
+            self.overhead_label.setText("")
+            return
+
+        kv_gb = self._estimate_kv_gb(model_gb, ctx, n_slots)
+        total_need = model_gb + kv_gb
+
+        # Color based on how well it fits
+        if total_need <= free_gb * 0.85:
+            color = "#2ecc71"  # green — comfortable
+            suffix = ""
+        elif total_need <= free_gb * 0.95:
+            color = "#f1c40f"  # yellow — snug
+            suffix = ""
+        elif total_need <= free_gb:
+            color = "#f39c12"  # orange — tight
+            suffix = ""
+        else:
+            color = "#e74c3c"  # red — won't fit
+            suffix = "  WON'T FIT"
+
+        text = (
+            f"Estimated Overhead: {total_need:.1f} GB"
+            f"  [{model_gb:.1f} GB model + {kv_gb:.1f} GB context]"
+            f"{suffix}"
+        )
+        self.overhead_label.setText(text)
+        self.overhead_label.setStyleSheet(f"color: {color};")
+
     # ── Cluster summary ──────────────────────────────────────────────────
 
     def _update_cluster(self):
+        # Update the summary row in the worker table
+        self._update_vram_summary_row()
+
         total_free = 0
         total_cap = 0
         for host, _port, _name in self.workers:
@@ -1133,37 +1711,10 @@ class LauncherWindow(QMainWindow):
                 total_cap += total
 
         if total_cap == 0:
-            self.cluster_vram_label.setText("Total VRAM: --")
-            self.cluster_fits_label.setText("")
+            self.cluster_rec_label.setText("")
             return
 
         free_gb = total_free / 1024
-        cap_gb = total_cap / 1024
-        self.cluster_vram_label.setText(
-            f"Total VRAM: {free_gb:.1f} GB free / {cap_gb:.1f} GB total"
-        )
-
-        # Show the biggest models that fit, including tight fits
-        runnable = []
-        for label, need_gb in reversed(MODEL_SIZES):
-            if need_gb <= free_gb:
-                pct = need_gb / free_gb * 100
-                runnable.append(f"{label}  ({need_gb:.0f} GB, {pct:.0f}%)")
-
-        # First model that won't fit
-        wont = None
-        for label, need_gb in MODEL_SIZES:
-            if need_gb > free_gb:
-                wont = f"{label} needs {need_gb:.0f} GB"
-                break
-
-        lines = []
-        if runnable:
-            lines.append("Can run:  " + "  |  ".join(runnable))
-        if wont:
-            lines.append(f"Next up:  {wont}")
-
-        self.cluster_fits_label.setText("\n".join(lines))
 
         # Best fit = largest model that leaves ~15-25% headroom for KV cache
         best = None
@@ -1182,8 +1733,8 @@ class LauncherWindow(QMainWindow):
             label, need_gb = best
             headroom = free_gb - need_gb
             self.cluster_rec_label.setText(
-                f"My Recommendation:  {label}  "
-                f"({need_gb:.0f} GB, leaves {headroom:.1f} GB for context)"
+                f"Recommendation:  {label}  "
+                f"[{need_gb:.0f} GB, leaves {headroom:.1f} GB for context]"
             )
         else:
             self.cluster_rec_label.setText("")
@@ -1194,6 +1745,8 @@ class LauncherWindow(QMainWindow):
             if not hasattr(self, "_last_ctx_free") or self._last_ctx_free != new_free:
                 self._last_ctx_free = new_free
                 self._update_context_options()
+
+        self._update_overhead()
 
     # ── Background threads ───────────────────────────────────────────────
 
@@ -1324,9 +1877,10 @@ class LauncherWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.browser_btn.setVisible(True)
 
-        # Hide cluster section and let worker table expand
-        self.cluster_frame.setVisible(False)
+        # Let worker table expand while server is running
         self._resize_worker_table(expanded=True)
+        self.overhead_label.setVisible(False)
+        self.cluster_rec_label.setVisible(False)
 
         # Expand monitor panel
         self._connected_workers = list(zip(rpc_addrs, rpc_names))
@@ -1398,8 +1952,9 @@ class LauncherWindow(QMainWindow):
             self.launch_btn.setText("Launch")
             self.stop_btn.setEnabled(False)
             self.browser_btn.setVisible(False)
-            self.cluster_frame.setVisible(True)
             self._resize_worker_table(expanded=False)
+            self.overhead_label.setVisible(True)
+            self.cluster_rec_label.setVisible(True)
             self._stop_monitor()
             self._update_tray_icon(False)
 
@@ -1502,6 +2057,44 @@ class LauncherWindow(QMainWindow):
         port = self._config.get("server_port", 8080)
         webbrowser.open(f"http://localhost:{port}")
 
+    def _on_unload(self):
+        """Kill all llama-server processes system-wide to free VRAM."""
+        # First, stop our own managed server if running
+        if self.server_proc:
+            self._on_stop()
+
+        # Then kill any remaining llama-server processes
+        killed = 0
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "llama-server"],
+                capture_output=True, text=True,
+            )
+            pids = result.stdout.strip().splitlines()
+            for pid in pids:
+                pid = pid.strip()
+                if not pid:
+                    continue
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                    killed += 1
+                except (ProcessLookupError, PermissionError):
+                    pass
+        except FileNotFoundError:
+            # pgrep not available, try killall
+            subprocess.run(
+                ["killall", "-9", "llama-server"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            killed = -1  # unknown count
+
+        if killed > 0:
+            self.status_label.setText(f"Killed {killed} llama-server process(es).")
+        elif killed == 0:
+            self.status_label.setText("No llama-server processes found.")
+        else:
+            self.status_label.setText("Sent kill signal to llama-server.")
+
     def _on_stop(self):
         self._kill_server()
         self.monitor_frame.setVisible(False)
@@ -1509,8 +2102,9 @@ class LauncherWindow(QMainWindow):
         self.launch_btn.setText("Launch")
         self.stop_btn.setEnabled(False)
         self.browser_btn.setVisible(False)
-        self.cluster_frame.setVisible(True)
         self._resize_worker_table(expanded=False)
+        self.overhead_label.setVisible(True)
+        self.cluster_rec_label.setVisible(True)
 
     def _stop_monitor(self):
         if self.server_monitor:
