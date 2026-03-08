@@ -40,7 +40,7 @@ _DEFAULT_SAMPLER_PROFILE = {
     "dynatemp_range": 0.0,
     "dynatemp_exponent": 1.0,
     "top_n_sigma": -1.0,
-    "samplers": "top_k,tfs_z,typical_p,top_p,min_p,temperature",
+    "samplers": "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature",
     # Penalties
     "repeat_penalty": 1.1,
     "repeat_last_n": 64,
@@ -59,7 +59,6 @@ _DEFAULT_SAMPLER_PROFILE = {
     "mirostat": 0,
     "mirostat_tau": 5.0,
     "mirostat_eta": 0.1,
-    "tfs_z": 1.0,
     "use_bos": True,
     "ignore_eos": False,
     "cache_prompt": True,
@@ -150,7 +149,6 @@ _SAMPLER_TABS = {
         ("mirostat", "Mirostat (0/1/2)"),
         ("mirostat_tau", "Mirostat Tau"),
         ("mirostat_eta", "Mirostat Eta"),
-        ("tfs_z", "Tail-Free Sampling (z)"),
         ("use_bos", "Add BOS Token"),
         ("ignore_eos", "Ignore EOS Token"),
         ("cache_prompt", "Cache Prompt"),
@@ -174,15 +172,13 @@ _SAMPLER_FLAGS = {
     "frequency_penalty": "--frequency-penalty",
     "presence_penalty": "--presence-penalty",
     "mirostat": "--mirostat",
-    "mirostat_tau": "--mirostat-tau",
-    "mirostat_eta": "--mirostat-eta",
-    "tfs_z": "--tfs",
+    "mirostat_tau": "--mirostat-ent",
+    "mirostat_eta": "--mirostat-lr",
     "seed": "--seed",
     "n_predict": "--n-predict",
     "dynatemp_range": "--dynatemp-range",
-    "dynatemp_exponent": "--dynatemp-exponent",
-    "top_n_sigma": "--top-n-sigma",
-    "penalize_nl": "--penalize-nl",
+    "dynatemp_exponent": "--dynatemp-exp",
+    "top_n_sigma": "--top-nsigma",
     "dry_multiplier": "--dry-multiplier",
     "dry_base": "--dry-base",
     "dry_allowed_length": "--dry-allowed-length",
@@ -191,8 +187,9 @@ _SAMPLER_FLAGS = {
     "xtc_threshold": "--xtc-threshold",
     "samplers": "--samplers",
     "ignore_eos": "--ignore-eos",
-    "cache_prompt": "--cache-prompt",
 }
+# Note: cache_prompt and penalize_nl are handled specially in _on_launch
+# since they use --no-cache-prompt (negated) and have no standalone CLI flag
 
 # Fields that are multiline text areas
 _MULTILINE_FIELDS = {"stop", "grammar", "json_schema"}
@@ -740,7 +737,8 @@ class SamplerDialog(QDialog):
 
         # ── Tabbed settings area ──
         self.tabs = QTabWidget()
-        self._fields = {}  # key → QLineEdit / QCheckBox / QTextEdit
+        self._fields = {}   # key → QLineEdit / QCheckBox / QTextEdit
+        self._toggles = {}  # key → QCheckBox (enable/disable toggle)
 
         for tab_name, fields in _SAMPLER_TABS.items():
             scroll = QScrollArea()
@@ -761,8 +759,19 @@ class SamplerDialog(QDialog):
                 else:
                     widget = QLineEdit(str(default_val))
 
+                # Enable/disable toggle checkbox
+                toggle = QCheckBox()
+                toggle.setChecked(True)
+                toggle.setToolTip(f"Enable/disable {label}")
+                toggle.toggled.connect(lambda checked, w=widget: w.setEnabled(checked))
+                self._toggles[key] = toggle
+
+                row_layout = QHBoxLayout()
+                row_layout.addWidget(toggle)
+                row_layout.addWidget(widget, 1)
+
                 self._fields[key] = widget
-                form.addRow(label + ":", widget)
+                form.addRow(label + ":", row_layout)
 
             scroll.setWidget(container)
             self.tabs.addTab(scroll, tab_name)
@@ -829,18 +838,37 @@ class SamplerDialog(QDialog):
         self.save_btn.setEnabled(not is_default)
         self.delete_btn.setEnabled(not is_default)
         self.rename_btn.setEnabled(not is_default)
-        # Make fields read-only for Default
+        # Make fields and toggles read-only for Default
         for key, widget in self._fields.items():
-            if isinstance(widget, QCheckBox):
-                widget.setEnabled(not is_default)
-            elif isinstance(widget, QTextEdit):
-                widget.setReadOnly(is_default)
+            toggle = self._toggles.get(key)
+            if is_default:
+                if toggle:
+                    toggle.setEnabled(False)
+                if isinstance(widget, QCheckBox):
+                    widget.setEnabled(False)
+                elif isinstance(widget, QTextEdit):
+                    widget.setReadOnly(True)
+                else:
+                    widget.setReadOnly(True)
             else:
-                widget.setReadOnly(is_default)
+                if toggle:
+                    toggle.setEnabled(True)
+                    enabled = toggle.isChecked()
+                else:
+                    enabled = True
+                if isinstance(widget, QCheckBox):
+                    widget.setEnabled(enabled)
+                elif isinstance(widget, QTextEdit):
+                    widget.setReadOnly(not enabled)
+                    widget.setEnabled(enabled)
+                else:
+                    widget.setReadOnly(not enabled)
+                    widget.setEnabled(enabled)
 
     def _populate_fields(self, profile_name):
         profiles = self.config["sampler_profiles"]
         profile = profiles.get(profile_name, _DEFAULT_SAMPLER_PROFILE)
+        enabled_map = profile.get("_enabled", {})
         for key, widget in self._fields.items():
             val = profile.get(key, _DEFAULT_SAMPLER_PROFILE.get(key, ""))
             if isinstance(widget, QCheckBox):
@@ -849,11 +877,19 @@ class SamplerDialog(QDialog):
                 widget.setPlainText(str(val) if val else "")
             else:
                 widget.setText(str(val))
+            # Restore enabled/disabled toggle (default to enabled)
+            toggle = self._toggles.get(key)
+            if toggle:
+                toggle.setChecked(enabled_map.get(key, True))
 
     def _read_fields(self):
         """Read all field values, returning a dict with properly typed values."""
         result = {}
+        enabled_map = {}
         for key, widget in self._fields.items():
+            toggle = self._toggles.get(key)
+            if toggle:
+                enabled_map[key] = toggle.isChecked()
             if isinstance(widget, QCheckBox):
                 result[key] = widget.isChecked()
             elif isinstance(widget, QTextEdit):
@@ -873,6 +909,7 @@ class SamplerDialog(QDialog):
                     except ValueError:
                         pass
                 result[key] = text
+        result["_enabled"] = enabled_map
         return result
 
     # ── Profile CRUD ──
@@ -2370,9 +2407,16 @@ class LauncherWindow(QMainWindow):
         profiles = self._config.get("sampler_profiles", {})
         sampler = profiles.get(active_profile, _DEFAULT_SAMPLER_PROFILE)
 
+        enabled_map = sampler.get("_enabled", {})
+        mirostat_on = sampler.get("mirostat", 0) not in (0, "0")
         for key, flag in _SAMPLER_FLAGS.items():
+            if not enabled_map.get(key, True):
+                continue
             val = sampler.get(key)
             if val is None:
+                continue
+            # Skip mirostat sub-params when mirostat is disabled
+            if key in ("mirostat_tau", "mirostat_eta") and not mirostat_on:
                 continue
             if isinstance(val, bool):
                 if val:
@@ -2383,23 +2427,30 @@ class LauncherWindow(QMainWindow):
             else:
                 cmd += [flag, str(val)]
 
+        # Cache prompt (enabled by default in llama-server, only pass flag to disable)
+        if enabled_map.get("cache_prompt", True) and not sampler.get("cache_prompt", True):
+            cmd.append("--no-cache-prompt")
+
         # Stop strings (one per line → multiple --stop flags)
-        stop_text = sampler.get("stop", "")
-        if stop_text:
-            for line in stop_text.splitlines():
-                line = line.strip()
-                if line:
-                    cmd += ["--stop", line]
+        if enabled_map.get("stop", True):
+            stop_text = sampler.get("stop", "")
+            if stop_text:
+                for line in stop_text.splitlines():
+                    line = line.strip()
+                    if line:
+                        cmd += ["--stop", line]
 
         # Grammar (passed inline)
-        grammar = sampler.get("grammar", "")
-        if grammar.strip():
-            cmd += ["--grammar", grammar.strip()]
+        if enabled_map.get("grammar", True):
+            grammar = sampler.get("grammar", "")
+            if grammar.strip():
+                cmd += ["--grammar", grammar.strip()]
 
         # JSON schema
-        json_schema = sampler.get("json_schema", "")
-        if json_schema.strip():
-            cmd += ["--json-schema", json_schema.strip()]
+        if enabled_map.get("json_schema", True):
+            json_schema = sampler.get("json_schema", "")
+            if json_schema.strip():
+                cmd += ["--json-schema", json_schema.strip()]
 
         try:
             self.server_proc = subprocess.Popen(
