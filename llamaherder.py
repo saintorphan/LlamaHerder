@@ -1601,11 +1601,10 @@ class LauncherWindow(QMainWindow):
         deploy_ssh_action.triggered.connect(self._open_deploy_ssh)
         workers_menu.addAction(deploy_ssh_action)
 
-        # ── Help menu ──
-        help_menu = menu_bar.addMenu("Help")
+        # ── Help button (direct action, no dropdown) ──
         help_action = QAction("Help", self)
         help_action.triggered.connect(self._open_help)
-        help_menu.addAction(help_action)
+        menu_bar.addAction(help_action)
 
         central = QWidget()
         self.setCentralWidget(central)
